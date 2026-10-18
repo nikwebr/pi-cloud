@@ -5,9 +5,11 @@ umask 077
 # Credentials deliberately stay out of this command line. Configure the model
 # provider through the platform administrator page after deployment.
 readonly NODE_VERSION="24.18.1"
-readonly NODE_ARCHIVE_SHA256="d6c664df3f3f61458e8c277585571328522d705166723a7c7823a9253a4d15a0"
+readonly NODE_ARCHIVE_SHA256_X64="d6c664df3f3f61458e8c277585571328522d705166723a7c7823a9253a4d15a0"
+readonly NODE_ARCHIVE_SHA256_ARM64="7201e3a09dc825bac57867c81913e2b8f0ef87d04cb9082af4cda82f6ff3d88c"
 readonly HELM_VERSION="v3.18.6"
-readonly HELM_ARCHIVE_SHA256="3f43c0aa57243852dd542493a0f54f1396c0bc8ec7296bbb2c01e802010819ce"
+readonly HELM_ARCHIVE_SHA256_AMD64="3f43c0aa57243852dd542493a0f54f1396c0bc8ec7296bbb2c01e802010819ce"
+readonly HELM_ARCHIVE_SHA256_ARM64="5b8e00b6709caab466cbbb0bc29ee09059b8dc9417991dd04b497530e49b1737"
 readonly K3S_VERSION="v1.36.2+k3s1"
 readonly K3S_INSTALLER_SHA256="46177d4c99440b4c0311b67233823a8e8a2fc09693f6c89af1a7161e152fbfad"
 readonly CUBE_COMMIT="8721dd151971ce3c2966482bbd32904ad98f378e"
@@ -37,8 +39,8 @@ usage() {
   cat <<'EOF'
 Usage: ./install.sh [options]
 
-Install or reconcile PiCloud on one x86_64 Linux host (native Linux or
-WSL2 with systemd and KVM).
+Install or reconcile PiCloud on one Linux host (x86_64 or arm64,
+native Linux or WSL2 with systemd and KVM).
 
 Options:
   --yes                         Skip the single confirmation prompt.
@@ -126,7 +128,7 @@ PiCloud self-hosted deployment plan
   Web endpoint:     http://${bind_address}:${http_port}
   Pi Worker mode:   ${pi_workers:-kubernetes for a fresh deployment; preserve existing mode on rerun}
 
-  1. Validate Linux x86_64, systemd, KVM, memory and disk capacity.
+  1. Validate Linux x86_64/arm64, systemd, KVM, memory and disk capacity.
   2. Install required Debian/Ubuntu packages and Docker Engine when absent.
   3. Install checksum-verified Node.js ${NODE_VERSION} and Helm ${HELM_VERSION}.
   4. Install/reuse single-node K3s ${K3S_VERSION}.
@@ -166,7 +168,8 @@ run_read_only_checks() {
   current_phase="read-only preflight"
   log "Read-only deployment preflight"
   [[ "$(uname -s)" == "Linux" ]] && check_pass "Linux host" || check_fail "Linux is required"
-  [[ "$(uname -m)" == "x86_64" ]] && check_pass "x86_64 architecture" || check_fail "Cube requires x86_64"
+  [[ "$(uname -m)" == "x86_64" || "$(uname -m)" == "aarch64" ]] &&
+    check_pass "$(uname -m) architecture" || check_fail "x86_64 or arm64 (aarch64) is required"
   systemd_usable && check_pass "systemd is available" || check_fail "systemd must be enabled"
   [[ -c /dev/kvm && -r /dev/kvm && -w /dev/kvm ]] && check_pass "/dev/kvm is usable" ||
     check_fail "read/write KVM access is required"
@@ -224,7 +227,7 @@ fi
 
 current_phase="host validation"
 [[ "$(uname -s)" == "Linux" ]] || fail "only Linux is supported"
-[[ "$(uname -m)" == "x86_64" ]] || fail "CubeSandbox requires x86_64"
+[[ "$(uname -m)" == "x86_64" || "$(uname -m)" == "aarch64" ]] || fail "x86_64 or arm64 (aarch64) is required"
 [[ "$(id -u)" -ne 0 ]] || fail "run as the deployment user, not root; sudo is requested only when needed"
 [[ -d "${repository_root}/.git" ]] || fail "PiCloud deployment requires a Git checkout"
 [[ -z "$(git -C "${repository_root}" status --porcelain)" ]] ||
@@ -281,15 +284,21 @@ download_verified() {
 
 install_local_node() {
   current_phase="Node.js toolchain installation"
-  local target="${repository_root}/.cache/tools/node-v${NODE_VERSION}-linux-x64"
+  local node_arch node_sha256
+  case "$(uname -m)" in
+    x86_64)  node_arch="x64";   node_sha256="${NODE_ARCHIVE_SHA256_X64}" ;;
+    aarch64) node_arch="arm64"; node_sha256="${NODE_ARCHIVE_SHA256_ARM64}" ;;
+    *) fail "unsupported architecture for Node.js download: $(uname -m)" ;;
+  esac
+  local target="${repository_root}/.cache/tools/node-v${NODE_VERSION}-linux-${node_arch}"
   if [[ -x "${target}/bin/node" && "$("${target}/bin/node" --version)" == "v${NODE_VERSION}" ]]; then
     export PATH="${target}/bin:${PATH}"; return
   fi
   [[ ! -e "${target}" ]] || fail "invalid Node cache at ${target}; move it aside and rerun"
-  log "Installing checksum-verified Node.js ${NODE_VERSION}"
+  log "Installing checksum-verified Node.js ${NODE_VERSION} (${node_arch})"
   local archive="${temporary_directory}/node.tar.xz" staging="${temporary_directory}/node"
-  download_verified "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz" \
-    "${archive}" "${NODE_ARCHIVE_SHA256}"
+  download_verified "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${node_arch}.tar.xz" \
+    "${archive}" "${node_sha256}"
   mkdir -p "${staging}" "$(dirname "${target}")"
   tar -xJf "${archive}" --strip-components=1 -C "${staging}"
   mv "${staging}" "${target}"
@@ -299,17 +308,23 @@ install_local_node() {
 
 install_local_helm() {
   current_phase="Helm toolchain installation"
+  local helm_arch helm_sha256
+  case "$(uname -m)" in
+    x86_64)  helm_arch="amd64"; helm_sha256="${HELM_ARCHIVE_SHA256_AMD64}" ;;
+    aarch64) helm_arch="arm64"; helm_sha256="${HELM_ARCHIVE_SHA256_ARM64}" ;;
+    *) fail "unsupported architecture for Helm download: $(uname -m)" ;;
+  esac
   local target="${repository_root}/.cache/tools/helm-v3.18.6"
   if [[ -x "${target}/helm" ]]; then export PATH="${target}:${PATH}"; return; fi
   [[ ! -e "${target}" ]] || fail "invalid Helm cache at ${target}; move it aside and rerun"
-  log "Installing checksum-verified Helm ${HELM_VERSION}"
+  log "Installing checksum-verified Helm ${HELM_VERSION} (${helm_arch})"
   local archive="${temporary_directory}/helm.tar.gz" staging="${temporary_directory}/helm"
-  download_verified "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" \
-    "${archive}" "${HELM_ARCHIVE_SHA256}"
+  download_verified "https://get.helm.sh/helm-${HELM_VERSION}-linux-${helm_arch}.tar.gz" \
+    "${archive}" "${helm_sha256}"
   mkdir -p "${staging}" "$(dirname "${target}")"
   tar -xzf "${archive}" -C "${staging}"
-  chmod 0755 "${staging}/linux-amd64/helm"
-  mv "${staging}/linux-amd64" "${target}"
+  chmod 0755 "${staging}/linux-${helm_arch}/helm"
+  mv "${staging}/linux-${helm_arch}" "${target}"
   export PATH="${target}:${PATH}"
 }
 
